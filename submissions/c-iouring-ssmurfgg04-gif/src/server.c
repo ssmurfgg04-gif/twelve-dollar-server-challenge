@@ -36,7 +36,7 @@
 #define RING_ENTRIES 1024
 #define CQ_ENTRIES 8192
 #define BUF_GROUP 0
-#define NBUFS 2048
+#define NBUFS 8192
 #define BUF_SIZE 2048
 #define MAX_OUT_HIGH 65536      /* stop reading a connection with this much unsent */
 #define STALL_MS 30000
@@ -65,6 +65,7 @@ enum {
     B_CLOSING = 1 << 3,
     B_SHUT = 1 << 4,
     B_PAUSED = 1 << 5,
+    B_TXWAIT = 1 << 6,
     B_DIRTY = 1 << 7,
 };
 
@@ -77,6 +78,8 @@ typedef struct {
     uint32_t out_off; /* epoll: send offset into out */
     uint32_t gen;
     uint32_t since_ms;
+    uint32_t tx_wait_ms; /* earliest send retry after EAGAIN (exponential backoff) */
+    uint8_t tx_bo;     /* current backoff, ms */
     uint8_t bits;
     uint8_t conn_hdr;
     uint8_t sent_continue;
@@ -101,6 +104,9 @@ static int nslots;              /* file table slots (shared, set before workers 
 static int g_mode_uring = 1;    /* 0: epoll fallback */
 static atomic_int mem_low;      /* 0 ok, 1 not accepting, 2+ shedding */
 static atomic_llong memcheck_q;
+static atomic_llong tx_eagain;  /* send-side EAGAINs seen (backoff indicator) */
+
+long long srv_tx_eagain_count(void) { return atomic_load(&tx_eagain); }
 static uint64_t start_ms;
 static int g_pgo_secs = 0;
 
@@ -459,7 +465,19 @@ static void u_on_send(struct io_uring_cqe *cqe, int slot, uint32_t gen)
     c->bits &= (uint8_t)~B_SENDING;
     int res = cqe->res;
     if (res < 0) {
-        if (res == -EAGAIN || res == -EINTR) { u_submit_send(slot); return; }
+        if (res == -EAGAIN || res == -EINTR) {
+            /* The socket's send buffer is full. Resubmitting at once just
+             * spins: an SQE + CQE pair per attempt, thousands per second per
+             * stalled connection, crowding out real work. Back off and let
+             * u_flush_dirty retry after tx_wait_ms. */
+            if (c->tx_bo == 0) c->tx_bo = 1;
+            else if (c->tx_bo < 64) c->tx_bo *= 2;
+            c->tx_wait_ms = (uint32_t)now_mono_ms() + c->tx_bo;
+            c->bits |= B_TXWAIT;
+            tx_eagain++;
+            mark_dirty(slot);
+            return;
+        }
         c->bits |= B_CLOSING;
         c->out.len = 0;
         c->fly.len = 0;
@@ -471,6 +489,9 @@ static void u_on_send(struct io_uring_cqe *cqe, int slot, uint32_t gen)
     if (c->fly_off < c->fly.len) { u_submit_send(slot); return; }
     buf_free(&c->fly);
     c->fly_off = 0;
+    c->tx_bo = 0;
+    c->tx_wait_ms = 0;
+    c->bits &= (uint8_t)~B_TXWAIT;
     if ((c->bits & B_PAUSED) && c->out.len <= MAX_OUT_HIGH / 2) {
         c->bits &= (uint8_t)~B_PAUSED;
         if (c->in.len) on_data(slot, NULL, 0);
@@ -481,15 +502,26 @@ static void u_on_send(struct io_uring_cqe *cqe, int slot, uint32_t gen)
     else if (c->bits & B_CLOSING) u_maybe_close(slot);
 }
 
-/* Hands queued responses to the kernel: swap out -> fly and send. */
+/* Hands queued responses to the kernel: swap out -> fly and send. Conns
+ * whose last send hit EAGAIN stay on the list until their backoff expires. */
 static void u_flush_dirty(void)
 {
-    for (int i = 0; i < ndirty; i++) {
+    int n0 = ndirty;
+    ndirty = 0;
+    for (int i = 0; i < n0; i++) {
         int slot = dirty[i];
         conn_t *c = &conns[slot];
         c->bits &= (uint8_t)~B_DIRTY;
         if (!(c->bits & B_OPEN) || (c->bits & B_SENDING)) continue;
-        if (c->out.len) {
+        if (c->fly.len) {
+            if ((c->bits & B_TXWAIT) && (uint32_t)now_mono_ms() < c->tx_wait_ms) {
+                c->bits |= B_DIRTY;
+                dirty[ndirty++] = slot;   /* keep waiting */
+                continue;
+            }
+            c->bits &= (uint8_t)~B_TXWAIT;
+            u_submit_send(slot);
+        } else if (c->out.len) {
             buf_free(&c->fly);
             c->fly = c->out;
             c->out = (buf_t){ 0 };
@@ -499,7 +531,6 @@ static void u_flush_dirty(void)
             u_maybe_close(slot);
         }
     }
-    ndirty = 0;
 }
 
 static int u_worker_init(int id)

@@ -22,6 +22,9 @@ void srv_send_continue(int slot);
 void srv_reset_continue(int slot);
 void srv_set_conn_hdr(int slot, int mode);
 
+/* Ops stats for the dbstats logger. */
+long long srv_tx_eagain_count(void);
+
 /* Connection introspection used by the feed retry logic. */
 int conn_open(int slot);
 uint32_t conn_gen(int slot);

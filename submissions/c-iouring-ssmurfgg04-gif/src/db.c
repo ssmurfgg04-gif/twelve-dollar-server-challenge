@@ -203,6 +203,9 @@ static void *checkpointer_main(void *arg)
                 fprintf(stderr, "dbstats: req n=%lld avg=%.1fms max=%.1fms\n",
                         rn, (double)atomic_load(&req_us) / rn / 1000.0,
                         (double)atomic_load(&req_max_us) / 1000.0);
+            extern long long srv_tx_eagain_count(void);
+            long long te = srv_tx_eagain_count();
+            if (te) fprintf(stderr, "dbstats: tx_eagain=%lld\n", te);
         }
     }
     return NULL;
