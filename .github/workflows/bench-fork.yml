@@ -1,0 +1,64 @@
+# Benchmark harness for my own fork: builds the submission and runs the
+# official k6 load against it on a GitHub runner (kernel 6.x, io_uring).
+# Not part of the upstream pull request.
+name: bench (fork only)
+on:
+  push:
+    branches: ["c-iouring-ssmurfgg04-gif"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sqlite3 jq curl openssl unzip
+
+      - name: k6
+        run: |
+          curl -fsSL https://github.com/grafana/k6/releases/download/v2.3.0/k6-v2.3.0-linux-amd64.tar.gz | tar xz
+          sudo mv k6-v2.3.0-linux-amd64/k6 /usr/local/bin/
+          k6 version
+
+      - name: seed
+        run: bash seed/make-seed.sh
+
+      - name: install
+        run: sudo bash submissions/c-iouring-ssmurfgg04-gif/install.sh
+
+      - name: build
+        run: bash submissions/c-iouring-ssmurfgg04-gif/build.sh
+
+      - name: test suite (42 checks)
+        run: bash test/run.sh submissions/c-iouring-ssmurfgg04-gif
+
+      - name: bench
+        run: |
+          set -euo pipefail
+          SUB=submissions/c-iouring-ssmurfgg04-gif
+          mkdir -p /tmp/bench
+          cp seed/feed.db /tmp/bench/feed.db
+          SQLITE_PATH=/tmp/bench/feed.db JWT_SECRET=twelve-dollar-challenge \
+            HOST=127.0.0.1 PORT=3000 taskset -c 0 bash $SUB/start.sh > /tmp/bench/server.log 2>&1 &
+          echo $! > /tmp/bench/pid
+          for i in $(seq 60); do
+            curl -sf http://127.0.0.1:3000/health >/dev/null && break
+            sleep 1
+          done
+          head -3 /tmp/bench/server.log
+          for V in 10000 20000 30000; do
+            echo "=== VUS=$V ==="
+            taskset -c 1-3 k6 run -e BASE_URL=http://127.0.0.1:3000 -e VUS=$V \
+              -e DURATION=60s -e RAMP_UP=45s -e TOKENS=$PWD/seed/tokens.json bench/load.js \
+              || { echo "VUS=$V FAILED"; tail -20 /tmp/bench/server.log; break; }
+          done
+          kill $(cat /tmp/bench/pid) 2>/dev/null || true
+          tail -5 /tmp/bench/server.log
