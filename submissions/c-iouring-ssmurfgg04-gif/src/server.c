@@ -40,7 +40,9 @@
 #define BUF_SIZE 2048
 #define MAX_OUT_HIGH 65536      /* stop reading a connection with this much unsent */
 #define STALL_MS 30000
+#ifndef NWORKERS
 #define NWORKERS 8
+#endif
 
 #ifndef WAIT_NR
 #define WAIT_NR 128             /* wake the loop once this many completions are ready... */
