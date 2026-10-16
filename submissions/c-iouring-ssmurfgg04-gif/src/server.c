@@ -95,6 +95,7 @@ static __thread int epfd = -1;
 static __thread int *dirty;
 static __thread int ndirty;
 
+static pthread_mutex_t db_mu = PTHREAD_MUTEX_INITIALIZER;  /* DIAG: pacing only */
 static int listen_fd;
 static int nslots;              /* file table slots (shared, set before workers start) */
 static int g_mode_uring = 1;    /* 0: epoll fallback */
@@ -615,6 +616,7 @@ static void *u_worker_main(void *arg)
             io_uring_submit(&ring);
         }
 
+        pthread_mutex_lock(&db_mu);   /* DIAG: pacing only, one worker per batch */
         io_uring_for_each_cqe(&ring, head, cqe) {
             n++;
             uint64_t u = cqe->user_data;
@@ -628,6 +630,7 @@ static void *u_worker_main(void *arg)
             }
         }
         io_uring_cq_advance(&ring, n);
+        pthread_mutex_unlock(&db_mu);
         last_n = n;
         if (buf_adds) { io_uring_buf_ring_advance(bufring, buf_adds); buf_adds = 0; }
         u_return_bufs();
@@ -790,6 +793,7 @@ static void *e_worker_main(void *arg)
         if (q != last && atomic_compare_exchange_strong(&memcheck_q, &last, q)) check_memory();
         int low = atomic_load(&mem_low);
 
+        pthread_mutex_lock(&db_mu);   /* DIAG: pacing only, one worker per batch */
         for (int i = 0; i < n; i++) {
             uint32_t slot = (uint32_t)(evs[i].data.u64 & 0xffffffff);
             uint32_t gen = (uint32_t)(evs[i].data.u64 >> 32);
@@ -850,6 +854,7 @@ static void *e_worker_main(void *arg)
                 }
             }
         }
+        pthread_mutex_unlock(&db_mu);
         e_flush_dirty();
 
         uint64_t now = now_mono_ms();
