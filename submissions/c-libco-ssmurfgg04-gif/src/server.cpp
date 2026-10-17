@@ -99,6 +99,7 @@ struct task_t {
 static conn_t *conns;
 static int g_maxfds = MAXFDS_DEFAULT;
 static std::vector<task_t *> g_idle;
+static stShareStack_t *g_ss;
 static long long g_created, g_accepts, g_closes, g_open, g_reqs;
 static long long g_wegain, g_regain, g_txn_fail;
 static int g_lfd = -1;
@@ -282,6 +283,8 @@ void on_data(int slot, const char *data, size_t n)
 
 /* ---------------------------------------------------------------- coroutines */
 
+static void grow_pool(int n);   /* below: the acceptor grows the pool on demand */
+
 static void park_task(task_t *t)
 {
     t->fd = -1;
@@ -306,6 +309,58 @@ static void drop_conn(task_t *t)
     g_open--;
 }
 
+/* One turn of the connection loop: flush, parse (leftover and/or fresh
+ * bytes), commit, repeat. Returns 0 when the connection is done.
+ *
+ * The no-busy-spin rule: on_data("") on leftover bytes is only retried
+ * when the previous pass made progress (consumed bytes or produced
+ * output). With no progress we always end up in co_poll(POLLIN), so an
+ * incomplete request parks the coroutine instead of spinning the loop. */
+static int conn_step(task_t *t)
+{
+    int fd = t->fd;
+    conn_t *c = &conns[fd];
+
+    /* flush queued responses first */
+    while (c->out.len > c->out_off) {
+        int w = write(fd, c->out.p + c->out_off, c->out.len - c->out_off);
+        if (w > 0) { c->out_off += w; continue; }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            g_wegain++;
+            struct pollfd pf = { .fd = fd, .events = POLLOUT | POLLERR | POLLHUP };
+            co_poll(co_get_epoll_ct(), &pf, 1, 5000);
+            continue;
+        }
+        if (w < 0 && errno == EINTR) continue;
+        return 0;
+    }
+    c->out.len = 0;
+    c->out_off = 0;
+    if (c->bits & B_CLOSING) return 0;
+
+    /* try to parse leftover bytes (possible now that out is drained) */
+    if (c->in.len) {
+        uint32_t before = c->in.len;
+        on_data(fd, "", 0);
+        end_txn();   /* a transaction from this request commits before its bytes go out */
+        if (c->out.len > 0 || c->in.len < before) return 1;
+        /* no progress: the request is incomplete, wait for more bytes */
+    }
+
+    struct pollfd pf = { .fd = fd, .events = POLLIN | POLLERR | POLLHUP };
+    co_poll(co_get_epoll_ct(), &pf, 1, -1);
+    int r = read(fd, t->rbuf, sizeof t->rbuf);
+    if (r == 0) return 0;
+    if (r < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) { g_regain++; return 1; }
+        if (errno == EINTR) return 1;
+        return 0;
+    }
+    on_data(fd, t->rbuf, (size_t)r);
+    end_txn();
+    return 1;
+}
+
 static void *conn_routine(void *arg)
 {
     co_enable_hook_sys();
@@ -313,51 +368,7 @@ static void *conn_routine(void *arg)
 
     for (;;) {
         if (t->fd == -1) { park_task(t); continue; }
-
-        int fd = t->fd;
-        for (;;) {
-            conn_t *c = &conns[fd];
-
-            /* parse whatever we already hold, or read more first */
-            if (c->in.len) {
-                on_data(fd, "", 0);
-            } else {
-                struct pollfd pf = { .fd = fd, .events = POLLIN | POLLERR | POLLHUP };
-                co_poll(co_get_epoll_ct(), &pf, 1, -1);
-                int r = read(fd, t->rbuf, sizeof t->rbuf);
-                if (r == 0) break;
-                if (r < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) { g_regain++; continue; }
-                    if (errno == EINTR) continue;
-                    break;
-                }
-                on_data(fd, t->rbuf, (size_t)r);
-            }
-
-            /* a transaction from this request commits before its bytes go out */
-            end_txn();
-            if (!(c->bits & B_OPEN)) break;
-
-            /* flush queued responses */
-            while (c->out.len > c->out_off) {
-                int w = write(fd, c->out.p + c->out_off, c->out.len - c->out_off);
-                if (w > 0) { c->out_off += w; continue; }
-                if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    g_wegain++;
-                    struct pollfd pf = { .fd = fd, .events = POLLOUT | POLLERR | POLLHUP };
-                    co_poll(co_get_epoll_ct(), &pf, 1, 5000);
-                    continue;
-                }
-                if (w < 0 && errno == EINTR) continue;
-                goto dead;
-            }
-            c->out.len = 0;
-            c->out_off = 0;
-
-            if (c->bits & B_CLOSING) break;
-            /* keep-alive: loop for the next request on this connection */
-        }
-dead:
+        while (t->fd != -1 && conn_step(t)) {}
         drop_conn(t);
         park_task(t);
     }
@@ -377,7 +388,12 @@ static void *accept_routine(void *)
             co_poll(co_get_epoll_ct(), &pf, 1, 1000);
             continue;
         }
-        if (fd >= g_maxfds || g_idle.empty()) { close(fd); continue; }
+        if (fd >= g_maxfds) { close(fd); continue; }
+        if (g_idle.empty()) {
+            /* pool exhausted: grow it (the cap above bounds memory) */
+            grow_pool(POOL_CHUNK);
+            if (g_idle.empty()) { close(fd); continue; }
+        }
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         int fl = fcntl(fd, F_GETFL, 0);        /* through libco's fcntl hook:
@@ -432,12 +448,12 @@ static void set_nonblock(int fd)
     fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
-static void grow_pool(int n, stShareStack_t *ss)
+static void grow_pool(int n)
 {
     stCoRoutineAttr_t attr;
     memset(&attr, 0, sizeof attr);
     attr.stack_size = 0;
-    attr.share_stack = ss;
+    attr.share_stack = g_ss;
     for (int i = 0; i < n && g_created < g_maxfds; i++) {
         task_t *t = (task_t *)calloc(1, sizeof *t);
         if (!t) { perror("calloc"); exit(1); }
@@ -482,8 +498,8 @@ static int child_main(const char *host, const char *port, const char *db_path,
 
     g_lfd = make_listener(host, port);
 
-    stShareStack_t *ss = co_alloc_sharestack(g_stacks, 128 * 1024);
-    grow_pool(POOL_CHUNK, ss);
+    g_ss = co_alloc_sharestack(g_stacks, 128 * 1024);
+    grow_pool(POOL_CHUNK);
 
     stCoRoutine_t *co = NULL;
     co_create(&co, NULL, accept_routine, NULL);
